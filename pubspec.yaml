@@ -1,5 +1,5 @@
 name: vibrainium
-description: Umbrella Neovim plugin and CLI binary exposing vivcs, viff, and other tools.
+description: Umbrella Neovim plugin and CLI binary exposing viworkspace, vivcs, viproblems, visearch, and other tools.
 version: 0.1.0
 publish_to: none
 
@@ -12,6 +12,14 @@ executables:
 dependencies:
   nvim:
     path: ../nvim
+  viagent:
+    path: ../viagent
+  viff:
+    path: ../viff
+  viproblems:
+    path: ../viproblems
+  visearch:
+    path: ../visearch
   visettings:
     path: ../visettings
   vivcs:

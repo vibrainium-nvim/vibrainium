@@ -1,12 +1,58 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:vibrainium/vibrainium.dart';
 
+String? _readFlag(List<String> args, String flag) {
+  final idx = args.indexOf(flag);
+  if (idx != -1 && idx + 1 < args.length) {
+    return args[idx + 1];
+  }
+  return null;
+}
+
 Future<void> main(List<String> args) async {
   if (args.isNotEmpty) {
     final sub = args.first;
-    if (sub == 'install') {
+    if (sub == 'agent-hook') {
+      final phase = (args.length > 1 && !args[1].startsWith('-'))
+          ? args[1]
+          : 'post';
+      final socketPath =
+          _readFlag(args, '--socket') ??
+          Platform.environment['VIBRAINIUM_SOCKET'] ??
+          '';
+      final chatId =
+          _readFlag(args, '--chat') ??
+          Platform.environment['VIBRAINIUM_CHAT_ID'] ??
+          '';
+      final providerStr = _readFlag(args, '--provider') ?? 'agy';
+      final provider = AgentProviderKind.fromString(providerStr);
+
+      var rawStdin = '';
+      try {
+        rawStdin = await utf8.decodeStream(stdin);
+      } catch (_) {}
+
+      if (socketPath.isNotEmpty && chatId.isNotEmpty) {
+        await VibrainiumDaemon.sendAgentHook(
+          socketPath: socketPath,
+          phase: phase,
+          chatId: chatId,
+          provider: providerStr,
+          rawJson: rawStdin,
+        );
+      }
+
+      stdout.writeln(
+        AgentHookConfig.formatHookStdout(
+          phase: phase,
+          provider: provider,
+        ),
+      );
+      return;
+    } else if (sub == 'install') {
       String? devPath;
       final devIdx = args.indexOf('--dev');
       if (devIdx != -1) {
@@ -60,7 +106,10 @@ Future<void> main(List<String> args) async {
         devPackagePath: devPkgPath,
       );
 
-      final daemon = VibrainiumDaemon(socketPath: socketPath);
+      final daemon = VibrainiumDaemon(
+        socketPath: socketPath,
+        devPackagePath: devPkgPath,
+      );
       final started = await daemon.start();
       if (!started) {
         return;
@@ -73,6 +122,11 @@ Future<void> main(List<String> args) async {
           HotReloader.watchDirs(
             [
               '$devPkgPath/lib',
+              '$monorepoRoot/viagent/lib',
+              '$monorepoRoot/viff/lib',
+              '$monorepoRoot/viproblems/lib',
+              '$monorepoRoot/visearch/lib',
+              '$monorepoRoot/visettings/lib',
               '$monorepoRoot/vivcs/lib',
               '$monorepoRoot/viworkspace/lib',
               '$monorepoRoot/nvim/lib',
@@ -117,7 +171,10 @@ Future<void> main(List<String> args) async {
     },
   );
 
-  final app = VibrainiumApp(nvim: Nvim(session));
+  final app = VibrainiumApp(
+    nvim: Nvim(session),
+    devPackagePath: devPkgPath,
+  );
 
   final watched = <StreamSubscription<FileSystemEvent>>[];
   if (devPkgPath != null) {
@@ -126,6 +183,10 @@ Future<void> main(List<String> args) async {
       HotReloader.watchDirs(
         [
           '$devPkgPath/lib',
+          '$monorepoRoot/viagent/lib',
+          '$monorepoRoot/viff/lib',
+          '$monorepoRoot/viproblems/lib',
+          '$monorepoRoot/visearch/lib',
           '$monorepoRoot/visettings/lib',
           '$monorepoRoot/vivcs/lib',
           '$monorepoRoot/viworkspace/lib',
