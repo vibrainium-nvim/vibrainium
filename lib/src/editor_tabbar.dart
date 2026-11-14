@@ -1,4 +1,7 @@
 import 'package:nvim/nvim.dart';
+import 'package:visettings/visettings.dart';
+
+import 'editor_home.dart';
 
 /// A single entry in [EditorTabContextMenu].
 class EditorTabMenuItem extends NvimContextMenuItem {
@@ -53,6 +56,17 @@ class EditorTabbar {
   final bool Function(int win) isPanelWin;
   final Future<void> Function(String filePath)? onAddFileToChat;
   final Future<void> Function(String filePath)? onRevealInFinder;
+  final Future<void> Function(int winId, int bufId)? onPreview;
+  final Future<void> Function(int winId, int bufId)? onPreviewToggle;
+  final Future<void> Function(int winId, int bufId)? onMarkdownPreview;
+  final Future<void> Function(int winId, int bufId)? onMarkdownToggle;
+  final bool Function(int win)? isPreviewWin;
+  final String? Function(int win)? getPreviewTitle;
+  final int? Function(int win)? getPreviewSourceBuf;
+  final Future<void> Function(int win)? onClosePreview;
+  final Future<void> Function(int win)? onShowEmptyHome;
+  final void Function(String path)? onTabClosedPath;
+  final Future<void> Function()? onSync;
 
   late final EditorTabContextMenu contextMenu = EditorTabContextMenu(nvim);
 
@@ -68,6 +82,17 @@ class EditorTabbar {
     required this.isPanelWin,
     this.onAddFileToChat,
     this.onRevealInFinder,
+    this.onPreview,
+    this.onPreviewToggle,
+    this.onMarkdownPreview,
+    this.onMarkdownToggle,
+    this.isPreviewWin,
+    this.getPreviewTitle,
+    this.getPreviewSourceBuf,
+    this.onClosePreview,
+    this.onShowEmptyHome,
+    this.onTabClosedPath,
+    this.onSync,
   });
 
   /// Returns an unmodifiable view of the open buffer IDs for editor window [win].
@@ -89,6 +114,111 @@ class EditorTabbar {
     }
     return _winActiveBuf[win] ??
         ((_winTabs[win]?.isNotEmpty ?? false) ? _winTabs[win]!.first : null);
+  }
+
+  /// Exports an [EditorLeafNode] representation of editor window [win] for session persistence.
+  Future<EditorLeafNode?> exportPaneForWindow(
+    int win,
+    String workspaceRoot,
+  ) async {
+    if (!await _isEditorWin(win)) return null;
+    final tabs = _winTabs[win] ?? const <int>[];
+    final activeBuf = _winActiveBuf[win] ??
+        (await nvim.winIsValid(win) ? await nvim.winGetBuf(win) : null);
+    final openFiles = <String>[];
+    String? activeFilePath;
+
+    for (final b in tabs) {
+      if (await _isTrackableFileBuf(b)) {
+        final name = await nvim.bufGetName(b);
+        if (name.trim().isNotEmpty) {
+          final rel = VibrainiumWorkspaceState.toRelativePath(workspaceRoot, name);
+          if (!openFiles.contains(rel)) {
+            openFiles.add(rel);
+          }
+          if (b == activeBuf) {
+            activeFilePath = rel;
+          }
+        }
+      }
+    }
+
+    if (activeFilePath == null &&
+        activeBuf != null &&
+        await _isTrackableFileBuf(activeBuf)) {
+      final name = await nvim.bufGetName(activeBuf);
+      if (name.trim().isNotEmpty) {
+        final rel = VibrainiumWorkspaceState.toRelativePath(workspaceRoot, name);
+        if (!openFiles.contains(rel)) {
+          openFiles.add(rel);
+        }
+        activeFilePath = rel;
+      }
+    }
+
+    int? width;
+    int? height;
+    try {
+      width = await nvim.winGetWidth(win);
+      height = await nvim.winGetHeight(win);
+    } catch (_) {}
+
+    if (openFiles.isEmpty && activeFilePath == null) {
+      return null;
+    }
+
+    return EditorLeafNode(
+      id: 'win-$win',
+      width: width,
+      height: height,
+      openFiles: List.unmodifiable(openFiles),
+      activeFile: activeFilePath,
+    );
+  }
+
+  /// Recursively parses Neovim's `winlayout()` AST and prunes non-editor windows,
+  /// returning an [EditorLayoutNode] representing the editor pane layout.
+  Future<EditorLayoutNode?> exportLayout(String workspaceRoot) async {
+    try {
+      final raw = await nvim.execLua('return vim.fn.winlayout()');
+      return await _parseRawLayout(raw, workspaceRoot);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<EditorLayoutNode?> _parseRawLayout(
+    Object? raw,
+    String workspaceRoot,
+  ) async {
+    if (raw is! List || raw.length < 2) return null;
+    final type = raw[0]?.toString();
+    if (type == 'leaf') {
+      final win = raw[1];
+      if (win is int && await _isEditorWin(win)) {
+        return exportPaneForWindow(win, workspaceRoot);
+      }
+      return null;
+    }
+    if (type == 'row' || type == 'col') {
+      final rawChildren = raw[1];
+      if (rawChildren is List) {
+        final children = <EditorLayoutNode>[];
+        for (final c in rawChildren) {
+          final parsed = await _parseRawLayout(c, workspaceRoot);
+          if (parsed != null) {
+            children.add(parsed);
+          }
+        }
+        if (children.isEmpty) return null;
+        if (children.length == 1) return children.first;
+        return EditorBranchNode(
+          type: type == 'col' ? 'col' : 'row',
+          children: children,
+        );
+      }
+    }
+    return null;
   }
 
   void resetForHotReload() {
@@ -166,8 +296,23 @@ vim.api.nvim_create_autocmd({ 'BufAdd', 'BufEnter', 'WinEnter', 'BufWinEnter', '
     } catch (_) {}
   }
 
+  bool _isPanelFiletype(String ft) {
+    if (ft.isEmpty) return false;
+    if (ft == EditorHomeView.homeFiletype) return false;
+    if (nonEditorFiletypes.contains(ft)) return true;
+    return ft.startsWith('viworkspace') ||
+        ft.startsWith('vivcs') ||
+        ft.startsWith('viff') ||
+        ft.startsWith('viproblems') ||
+        ft.startsWith('viagent') ||
+        ft.startsWith('visearch') ||
+        ft.startsWith('vibrainium');
+  }
+
   Future<bool> _isEditorWin(int win) async {
-    if (win <= 0 || isPanelWin(win)) return false;
+    if (win <= 0) return false;
+    if (isPreviewWin?.call(win) ?? false) return true;
+    if (isPanelWin(win)) return false;
     try {
       if (!await nvim.winIsValid(win)) return false;
       final config = await nvim.winGetConfig(win);
@@ -176,7 +321,12 @@ vim.api.nvim_create_autocmd({ 'BufAdd', 'BufEnter', 'WinEnter', 'BufWinEnter', '
       final buf = await nvim.winGetBuf(win);
       if (buf > 0) {
         final ft = (await nvim.bufGetOption(buf, 'filetype'))?.toString() ?? '';
-        if (nonEditorFiletypes.contains(ft)) return false;
+        if (ft == 'vibrainium-preview' ||
+            ft == EditorHomeView.homeFiletype ||
+            (isPreviewWin?.call(win) ?? false)) {
+          return true;
+        }
+        if (_isPanelFiletype(ft)) return false;
         final bt = (await nvim.bufGetOption(buf, 'buftype'))?.toString() ?? '';
         if (bt.isNotEmpty) return false;
       }
@@ -193,7 +343,7 @@ vim.api.nvim_create_autocmd({ 'BufAdd', 'BufEnter', 'WinEnter', 'BufWinEnter', '
       final bt = (await nvim.bufGetOption(buf, 'buftype'))?.toString() ?? '';
       if (bt.isNotEmpty) return false;
       final ft = (await nvim.bufGetOption(buf, 'filetype'))?.toString() ?? '';
-      if (nonEditorFiletypes.contains(ft)) return false;
+      if (ft == EditorHomeView.homeFiletype || _isPanelFiletype(ft)) return false;
       final name = (await nvim.bufGetName(buf)).trim();
       if (name.isEmpty) return false;
       return true;
@@ -202,11 +352,32 @@ vim.api.nvim_create_autocmd({ 'BufAdd', 'BufEnter', 'WinEnter', 'BufWinEnter', '
     }
   }
 
+  Future<void> _applyWinbar(int win, String winbar) async {
+    if (_lastWinbar[win] == winbar) {
+      try {
+        final res = await nvim.rpc.request(
+          'nvim_get_option_value',
+          [
+            'winbar',
+            {'win': win},
+          ],
+        );
+        final current = res?.toString() ?? '';
+        if (current == winbar) return;
+      } catch (_) {
+        return;
+      }
+    }
+    _lastWinbar[win] = winbar;
+    await nvim.winSetOption(win, 'winbar', winbar);
+  }
+
   /// Synchronizes per-split tab lists with current Neovim windows/buffers and
   /// updates each editor window's `winbar`.
   Future<void> sync() async {
     await _ensureInitialized();
     await _enforceHiddenGlobalTabline();
+    await onSync?.call();
 
     final allWins = await nvim.listWins();
     final validWinSet = allWins.toSet();
@@ -246,11 +417,12 @@ vim.api.nvim_create_autocmd({ 'BufAdd', 'BufEnter', 'WinEnter', 'BufWinEnter', '
         ..addAll(filtered);
 
       final curBuf = await nvim.winGetBuf(win);
-      if (await checkBuf(curBuf)) {
-        if (!existing.contains(curBuf)) {
-          existing.add(curBuf);
+      final effectiveBuf = getPreviewSourceBuf?.call(win) ?? curBuf;
+      if (await checkBuf(effectiveBuf)) {
+        if (!existing.contains(effectiveBuf)) {
+          existing.add(effectiveBuf);
         }
-        _winActiveBuf[win] = curBuf;
+        _winActiveBuf[win] = effectiveBuf;
       } else if (existing.isEmpty) {
         _winActiveBuf.remove(win);
       } else if (!_winActiveBuf.containsKey(win) ||
@@ -273,13 +445,16 @@ vim.api.nvim_create_autocmd({ 'BufAdd', 'BufEnter', 'WinEnter', 'BufWinEnter', '
     }
 
     for (final win in editorWins) {
+      if (isPreviewWin?.call(win) == true) {
+        final title = getPreviewTitle?.call(win) ?? '󰍔 Preview';
+        final winbar = '%#VibrainiumTabActive# $title %#VibrainiumTabClose#%@VibrainiumWinbarClose@✕%X%*';
+        await _applyWinbar(win, winbar);
+        continue;
+      }
       final tabs = _winTabs[win] ?? const <int>[];
       if (tabs.isEmpty) {
         _winTabSpans.remove(win);
-        if (_lastWinbar[win] != '') {
-          _lastWinbar[win] = '';
-          await nvim.winSetOption(win, 'winbar', '');
-        }
+        await _applyWinbar(win, '');
         continue;
       }
       final activeBuf = _winActiveBuf[win] ?? tabs.first;
@@ -296,10 +471,7 @@ vim.api.nvim_create_autocmd({ 'BufAdd', 'BufEnter', 'WinEnter', 'BufWinEnter', '
         maxWidth: winWidth,
       );
       _winTabSpans[win] = spans;
-      if (_lastWinbar[win] != winbar) {
-        _lastWinbar[win] = winbar;
-        await nvim.winSetOption(win, 'winbar', winbar);
-      }
+      await _applyWinbar(win, winbar);
     }
   }
 
@@ -447,6 +619,28 @@ vim.api.nvim_create_autocmd({ 'BufAdd', 'BufEnter', 'WinEnter', 'BufWinEnter', '
           }
         },
       ),
+      if (_isPreviewablePath(normPath)) ...[
+        if (onPreview != null || onMarkdownPreview != null)
+          EditorTabMenuItem(
+            label: 'Preview in Split',
+            shortcut: 'p',
+            onSelect: () async {
+              await restoreEditorFocus();
+              final fn = onPreview ?? onMarkdownPreview;
+              if (fn != null) await fn(targetWin, targetBuf);
+            },
+          ),
+        if (onPreviewToggle != null || onMarkdownToggle != null)
+          EditorTabMenuItem(
+            label: 'Toggle Render Mode',
+            shortcut: 't',
+            onSelect: () async {
+              await restoreEditorFocus();
+              final fn = onPreviewToggle ?? onMarkdownToggle;
+              if (fn != null) await fn(targetWin, targetBuf);
+            },
+          ),
+      ],
       EditorTabMenuItem(
         label: 'Split',
         shortcut: 's ▸',
@@ -487,20 +681,20 @@ vim.api.nvim_create_autocmd({ 'BufAdd', 'BufEnter', 'WinEnter', 'BufWinEnter', '
       ),
     ];
 
+    final mnemonics = <String, int>{};
+    for (var i = 0; i < items.length; i++) {
+      final shortcutKey = items[i].shortcut.trim().split(' ').first.toLowerCase();
+      if (shortcutKey.isNotEmpty) {
+        mnemonics[shortcutKey] = i;
+      }
+    }
+
     await contextMenu.open(
       items: items,
       title: title,
       row: menuRow,
       col: menuCol,
-      extraMnemonics: const <String, int>{
-        'y': 0,
-        'a': 1,
-        'f': 2,
-        's': 3,
-        'o': 4,
-        'r': 5,
-        'x': 6,
-      },
+      extraMnemonics: mnemonics,
       onCancel: restoreEditorFocus,
     );
   }
@@ -611,6 +805,13 @@ vim.api.nvim_create_autocmd({ 'BufAdd', 'BufEnter', 'WinEnter', 'BufWinEnter', '
     final targetWin = await _resolveTargetEditorWin(winId, fallbackEditorWin);
     if (targetWin == null) return;
 
+    if (isPreviewWin?.call(targetWin) == true) {
+      if (onClosePreview != null) {
+        await onClosePreview!(targetWin);
+      }
+      return;
+    }
+
     final tabs = _winTabs[targetWin];
     if (tabs == null || tabs.isEmpty) return;
 
@@ -618,6 +819,15 @@ vim.api.nvim_create_autocmd({ 'BufAdd', 'BufEnter', 'WinEnter', 'BufWinEnter', '
     final targetBuf = (bufId != null && bufId > 0) ? bufId : currentBuf;
     final idx = tabs.indexOf(targetBuf);
     if (idx < 0) return;
+
+    if (onTabClosedPath != null) {
+      try {
+        final closedName = (await nvim.bufGetName(targetBuf)).trim();
+        if (closedName.isNotEmpty) {
+          onTabClosedPath!(closedName);
+        }
+      } catch (_) {}
+    }
 
     tabs.removeAt(idx);
 
@@ -628,9 +838,7 @@ vim.api.nvim_create_autocmd({ 'BufAdd', 'BufEnter', 'WinEnter', 'BufWinEnter', '
         _winActiveBuf[targetWin] = nextBuf;
         await nvim.winSetBuf(targetWin, nextBuf);
       } else {
-        _winActiveBuf.remove(targetWin);
-        final emptyBuf = await nvim.createBuf(listed: true, scratch: false);
-        await nvim.winSetBuf(targetWin, emptyBuf);
+        await _handleEmptyEditorPane(targetWin);
       }
     } else if (_winActiveBuf[targetWin] == targetBuf) {
       _winActiveBuf[targetWin] =
@@ -704,8 +912,9 @@ vim.api.nvim_create_autocmd({ 'BufAdd', 'BufEnter', 'WinEnter', 'BufWinEnter', '
     await sync();
   }
 
-  /// Closes all tabs in editor split [winId] (or current editor split), leaving a clean
-  /// unnamed buffer in that split so the split layout is preserved.
+  /// Closes all tabs in editor split [winId] (or current editor split).
+  /// If other editor splits exist, closes this split; otherwise preserves the
+  /// last editor pane with [onShowEmptyHome] (or an unnamed buffer fallback).
   Future<void> closeAllTabs({
     int? winId,
     int? fallbackEditorWin,
@@ -716,12 +925,47 @@ vim.api.nvim_create_autocmd({ 'BufAdd', 'BufEnter', 'WinEnter', 'BufWinEnter', '
     await sync();
     final tabs = _winTabs[targetWin];
     if (tabs != null) {
+      if (onTabClosedPath != null) {
+        for (final b in tabs) {
+          try {
+            final name = (await nvim.bufGetName(b)).trim();
+            if (name.isNotEmpty) {
+              onTabClosedPath!(name);
+            }
+          } catch (_) {}
+        }
+      }
       tabs.clear();
     }
+    await _handleEmptyEditorPane(targetWin);
+    await sync();
+  }
+
+  Future<void> _handleEmptyEditorPane(int targetWin) async {
     _winActiveBuf.remove(targetWin);
+    final allWins = await nvim.listWins();
+    final otherEditorWins = <int>[];
+    for (final w in allWins) {
+      if (w != targetWin && await _isEditorWin(w)) {
+        otherEditorWins.add(w);
+      }
+    }
+    if (otherEditorWins.isNotEmpty) {
+      _winTabs.remove(targetWin);
+      _lastWinbar.remove(targetWin);
+      _winTabSpans.remove(targetWin);
+      await nvim.winClose(targetWin, force: true);
+      await nvim.setCurrentWin(otherEditorWins.first);
+      return;
+    }
+
+    if (onShowEmptyHome != null) {
+      await onShowEmptyHome!(targetWin);
+      return;
+    }
+
     final emptyBuf = await nvim.createBuf(listed: true, scratch: false);
     await nvim.winSetBuf(targetWin, emptyBuf);
-    await sync();
   }
 
   /// Copies the normalized path of [bufId] (or the active buffer) in editor split [winId].
@@ -936,6 +1180,20 @@ vim.api.nvim_create_autocmd({ 'BufAdd', 'BufEnter', 'WinEnter', 'BufWinEnter', '
       }
     }
     return result;
+  }
+
+  static bool _isPreviewablePath(String path) {
+    final lower = path.toLowerCase();
+    return lower.endsWith('.md') ||
+        lower.endsWith('.markdown') ||
+        lower.endsWith('.mdx') ||
+        lower.endsWith('.svg') ||
+        lower.endsWith('.png') ||
+        lower.endsWith('.jpg') ||
+        lower.endsWith('.jpeg') ||
+        lower.endsWith('.webp') ||
+        lower.endsWith('.gif') ||
+        lower.endsWith('.heic');
   }
 
   static String _normalizePath(String rawPath) {

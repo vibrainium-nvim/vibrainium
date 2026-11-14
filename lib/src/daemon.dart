@@ -293,13 +293,20 @@ class VibrainiumDaemon {
     _idleTimer = null;
     _sockets.add(socket);
 
+    var isClosed = false;
+    socket.done.catchError((_) {});
+
     late final RpcSession rpcSession;
     late final VibrainiumApp app;
 
     void cleanupClient() {
+      if (isClosed) return;
+      isClosed = true;
       _sockets.remove(socket);
       sessions.remove(app);
-      socket.destroy();
+      try {
+        socket.destroy();
+      } catch (_) {}
       if (sessions.isEmpty) {
         _scheduleIdleCheck();
       }
@@ -321,6 +328,7 @@ class VibrainiumDaemon {
     rpcSession = RpcSession(
       input: inputController.stream,
       output: (bytes) {
+        if (isClosed) return;
         try {
           socket.add(bytes);
         } catch (_) {}

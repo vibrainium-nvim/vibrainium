@@ -34,6 +34,7 @@ class _FakeNvimServer {
   int currentWin = 1;
   int? alternateWin;
   Map<String, Object?>? mousePos;
+  final List<String> execLuaCalls = [];
 
   _FakeNvimServer({required this.cwd}) {
     serverSession = RpcSession(
@@ -120,6 +121,9 @@ class _FakeNvimServer {
         validWins.add(win);
         winBufs[win] = buf;
         winConfigs[win] = config;
+        if (config.containsKey('width')) {
+          winWidths[win] = config['width'] as int;
+        }
         cursors[win] = (1, 0);
         if (enter) {
           currentWin = win;
@@ -152,6 +156,7 @@ class _FakeNvimServer {
         return null;
       case 'nvim_exec_lua':
         final code = params[0].toString();
+        execLuaCalls.add(code);
         if (code.contains('vim.diagnostic.get')) {
           return rawDiagnostics;
         }
@@ -161,6 +166,11 @@ class _FakeNvimServer {
       case 'nvim_win_get_width':
         final win = params[0] as int;
         return winWidths[win] ?? 80;
+      case 'nvim_win_set_width':
+        final win = params[0] as int;
+        final w = params[1] as int;
+        winWidths[win] = w;
+        return null;
       case 'nvim_win_get_cursor':
         final win = params[0] as int;
         final c = cursors[win] ?? (1, 0);
@@ -301,6 +311,8 @@ void main() {
       expect(server.winOptions[mainWin]!['signcolumn'], 'no');
       expect(server.winOptions[mainWin]!['foldcolumn'], '0');
       expect(server.winOptions[mainWin]!['statuscolumn'], '');
+      expect(server.winOptions[mainWin]!['scrolloff'], 0);
+      expect(server.winOptions[mainWin]!['sidescrolloff'], 0);
       expect(server.winConfigs[tabbarWin]!['win'], mainWin);
       expect(server.winConfigs[tabbarWin]!['split'], 'below');
       expect(server.winConfigs[tabbarWin]!['height'], 1);
@@ -1227,6 +1239,161 @@ void main() {
         999999,
       ]);
       expect(app.editorTabbar.contextMenu.isOpen, isTrue);
+
+      await server.dispose();
+    });
+
+    test('supports resizing explorer panel dynamically, persists across toggles, and updates tabbar padding', () async {
+      final tempDir = await Directory.systemTemp.createTemp('vibrainium_resize_test_');
+      final server = _FakeNvimServer(cwd: tempDir.path);
+      final app = VibrainiumApp(
+        nvim: Nvim(server.clientSession),
+        sidebarWidth: 38,
+      );
+
+      // Open workspace sidebar
+      await server.serverSession.request('vibrainium_action', ['workspace.open']);
+      expect(await app.isOpen(), isTrue);
+      final mainWin = app.mainWindowId!;
+      expect(server.winWidths[mainWin], 38);
+      expect(app.currentSidebarWidth, 38);
+
+      // Verify initial tabbar line has padding for width 38
+      final tabbarBuf = app.tabbarBufferId!;
+      final initialLine = server.bufLines[tabbarBuf]!.first;
+      expect(initialLine.runes.length, 38);
+
+      // 1. Programmatic resize via workspace.resize action
+      await server.serverSession.request('vibrainium_action', ['workspace.resize', 52]);
+      expect(app.currentSidebarWidth, 52);
+      expect(app.workspaceSidebar.sidebarWidth, 52);
+      expect(app.vcsSidebar.sidebarWidth, 52);
+      expect(server.winWidths[mainWin], 52);
+
+      // Tabbar is re-rendered to match new width 52
+      final resizedLine = server.bufLines[tabbarBuf]!.first;
+      expect(resizedLine.runes.length, 52);
+
+      // 2. External resize (e.g. mouse drag or :vertical resize) caught by WinResized / editor_tab.sync
+      server.winWidths[mainWin] = 60;
+      await server.serverSession.request('vibrainium_action', ['editor_tab.sync']);
+      expect(app.currentSidebarWidth, 60);
+      expect(app.workspaceSidebar.sidebarWidth, 60);
+      expect(app.vcsSidebar.sidebarWidth, 60);
+      expect(server.bufLines[tabbarBuf]!.first.runes.length, 60);
+
+      // 3. Resized width persists across toggling the panel
+      await server.serverSession.request('vibrainium_action', ['workspace.toggle']);
+      expect(await app.isOpen(), isFalse);
+
+      await server.serverSession.request('vibrainium_action', ['workspace.toggle']);
+      expect(await app.isOpen(), isTrue);
+      final newMainWin = app.mainWindowId!;
+      expect(server.winWidths[newMainWin], 60);
+      expect(server.winConfigs[newMainWin]!['width'], 60);
+
+      // 4. Resized width persists when switching tabs (Workspace -> VCS -> Workspace)
+      await server.serverSession.request('vibrainium_action', ['vcs.open']);
+      expect(server.winWidths[app.mainWindowId!], 60);
+      expect(server.bufLines[tabbarBuf]!.first.runes.length, 60);
+
+      await server.serverSession.request('vibrainium_action', ['workspace.open']);
+      expect(server.winWidths[app.mainWindowId!], 60);
+      expect(server.bufLines[tabbarBuf]!.first.runes.length, 60);
+
+      await server.dispose();
+      await tempDir.delete(recursive: true);
+    });
+
+    test('quitting any sub-pane in left or bottom panel via win_closed closes the whole panel', () async {
+      final server = _FakeNvimServer(cwd: tempDir.path);
+      final app = VibrainiumApp(nvim: Nvim(server.clientSession), vcsList: const []);
+
+      // 1. Open left panel (Workspace with searchPrompt + tabbar) and bottom panel (Agents with termWin + tabbar)
+      await server.serverSession.request('vibrainium_action', ['workspace.open']);
+      await server.serverSession.request('vibrainium_action', ['agents.open']);
+
+      expect(
+        server.execLuaCalls.any(
+          (c) => c.contains('VibrainiumPanelWinClosed') && c.contains('WinClosed'),
+        ),
+        isTrue,
+      );
+
+      expect(await app.isOpen(), isTrue);
+      expect(await app.isBottomPanelOpen(), isTrue);
+
+      final leftMain = app.mainWindowId!;
+      final leftTabbar = app.tabbarWindowId!;
+      final leftSearch = app.workspaceSidebar.searchPrompt.windowId!;
+      final bottomMain = app.bottomMainWindowId!;
+      final bottomTabbar = app.bottomTabbarWindowId!;
+      final bottomTerm = app.agentsPanel.termWindowId!;
+
+      // Quitting the agent terminal sub-pane closes the entire bottom panel, leaving left panel open
+      server.validWins.remove(bottomTerm);
+      await server.serverSession.request('vibrainium_action', ['win_closed', bottomTerm]);
+
+      expect(await app.isBottomPanelOpen(), isFalse);
+      expect(app.bottomMainWindowId, isNull);
+      expect(app.bottomTabbarWindowId, isNull);
+      expect(app.agentsPanel.termWindowId, isNull);
+      expect(server.validWins.contains(bottomMain), isFalse);
+      expect(server.validWins.contains(bottomTabbar), isFalse);
+      expect(await app.isOpen(), isTrue);
+
+      // Quitting the workspace searchPrompt sub-pane closes the entire left panel
+      server.validWins.remove(leftSearch);
+      await server.serverSession.request('vibrainium_action', ['win_closed', leftSearch]);
+
+      expect(await app.isOpen(), isFalse);
+      expect(app.mainWindowId, isNull);
+      expect(app.tabbarWindowId, isNull);
+      expect(app.workspaceSidebar.searchPrompt.windowId, isNull);
+      expect(server.validWins.contains(leftMain), isFalse);
+      expect(server.validWins.contains(leftTabbar), isFalse);
+
+      // 2. Reopen both panels, verify quitting tabbar or main window also closes whole panel
+      await server.serverSession.request('vibrainium_action', ['workspace.open']);
+      await server.serverSession.request('vibrainium_action', ['problems.open']);
+
+      final leftTabbar2 = app.tabbarWindowId!;
+      final leftMain2 = app.mainWindowId!;
+      final leftSearch2 = app.workspaceSidebar.searchPrompt.windowId!;
+      server.validWins.remove(leftTabbar2);
+      await server.serverSession.request('vibrainium_action', ['win_closed', leftTabbar2]);
+      expect(await app.isOpen(), isFalse);
+      expect(server.validWins.contains(leftMain2), isFalse);
+      expect(server.validWins.contains(leftSearch2), isFalse);
+
+      final bottomMain2 = app.bottomMainWindowId!;
+      final bottomTabbar2 = app.bottomTabbarWindowId!;
+      server.validWins.remove(bottomMain2);
+      await server.serverSession.request('vibrainium_action', ['win_closed', bottomMain2]);
+      expect(await app.isBottomPanelOpen(), isFalse);
+      expect(server.validWins.contains(bottomTabbar2), isFalse);
+
+      // 3. Reopen and verify quitting bottom tabbar closes whole bottom panel
+      await server.serverSession.request('vibrainium_action', ['agents.open']);
+      final bottomMain3 = app.bottomMainWindowId!;
+      final bottomTabbar3 = app.bottomTabbarWindowId!;
+      final bottomTerm3 = app.agentsPanel.termWindowId!;
+      server.validWins.remove(bottomTabbar3);
+      await server.serverSession.request('vibrainium_action', ['win_closed', bottomTabbar3]);
+      expect(await app.isBottomPanelOpen(), isFalse);
+      expect(server.validWins.contains(bottomMain3), isFalse);
+      expect(server.validWins.contains(bottomTerm3), isFalse);
+
+      // 4. Switching tabs does NOT close panels
+      await server.serverSession.request('vibrainium_action', ['workspace.open']);
+      await server.serverSession.request('vibrainium_action', ['vcs.open']);
+      expect(await app.isOpen(), isTrue);
+      expect(app.activeTab, VibrainiumTab.vcs);
+
+      await server.serverSession.request('vibrainium_action', ['agents.open']);
+      await server.serverSession.request('vibrainium_action', ['problems.open']);
+      expect(await app.isBottomPanelOpen(), isTrue);
+      expect(app.activeBottomTab, VibrainiumBottomTab.problems);
 
       await server.dispose();
     });

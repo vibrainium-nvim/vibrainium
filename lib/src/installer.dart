@@ -137,6 +137,12 @@ local subcommands = {
   ['workspace.close'] = function() require('vibrainium').workspace_close() end,
   ['workspace.refresh'] = function() require('vibrainium').workspace_refresh() end,
   ['workspace.reveal'] = function() require('vibrainium').workspace_reveal() end,
+  ['workspace.save_state'] = function() require('vibrainium').workspace_save_state() end,
+  ['workspace.savestate'] = function() require('vibrainium').workspace_save_state() end,
+  ['workspace.restore_state'] = function() require('vibrainium').workspace_restore_state() end,
+  ['workspace.restorestate'] = function() require('vibrainium').workspace_restore_state() end,
+  ['workspace.resize'] = function(w) require('vibrainium').workspace_resize(w) end,
+  ['sidebar.resize'] = function(w) require('vibrainium').sidebar_resize(w) end,
   ['problems.open'] = function() require('vibrainium').problems_open() end,
   ['problems.toggle'] = function() require('vibrainium').problems_toggle() end,
   ['problems.close'] = function() require('vibrainium').problems_close() end,
@@ -178,6 +184,9 @@ local subcommands = {
   ['buffer.copy_path'] = function() require('vibrainium').buffer_copy_path() end,
   ['buffer.reveal'] = function() require('vibrainium').buffer_reveal() end,
   ['buffer.menu'] = function() require('vibrainium').buffer_menu() end,
+  ['buffer.preview'] = function() require('vibrainium').buffer_preview() end,
+  ['buffer.preview_toggle'] = function() require('vibrainium').buffer_preview_toggle() end,
+  ['buffer.preview_split'] = function() require('vibrainium').buffer_preview_split() end,
   ['tab.next'] = function() require('vibrainium').tab_next() end,
   ['tab.prev'] = function() require('vibrainium').tab_prev() end,
   ['panel.toggleleft'] = function() require('vibrainium').left_panel_toggle() end,
@@ -200,6 +209,8 @@ local completions = {
   'Workspace.Close',
   'Workspace.Refresh',
   'Workspace.Reveal',
+  'Workspace.Resize',
+  'Sidebar.Resize',
   'Problems.Open',
   'Problems.Toggle',
   'Problems.Close',
@@ -230,6 +241,9 @@ local completions = {
   'Buffer.CopyPath',
   'Buffer.Reveal',
   'Buffer.Menu',
+  'Buffer.Preview',
+  'Buffer.PreviewToggle',
+  'Buffer.PreviewSplit',
   'Tab.Next',
   'Tab.Prev',
   'Panel.ToggleLeft',
@@ -303,6 +317,14 @@ end, { desc = 'Refresh the viworkspace explorer side panel' })
 vim.api.nvim_create_user_command('VibrainiumWorkspaceReveal', function()
   require('vibrainium').workspace_reveal()
 end, { desc = 'Reveal the active buffer file in the viworkspace explorer side panel' })
+
+vim.api.nvim_create_user_command('VibrainiumWorkspaceResize', function(opts)
+  require('vibrainium').workspace_resize(opts.args)
+end, { nargs = 1, desc = 'Resize the viworkspace explorer side panel' })
+
+vim.api.nvim_create_user_command('VibrainiumSidebarResize', function(opts)
+  require('vibrainium').sidebar_resize(opts.args)
+end, { nargs = 1, desc = 'Resize the unified Vibrainium left side panel' })
 
 vim.api.nvim_create_user_command('VibrainiumProblemsToggle', function()
   require('vibrainium').problems_toggle()
@@ -381,6 +403,70 @@ end, { desc = 'Close the active tab in the current editor split' })
 vim.api.nvim_create_user_command('VibrainiumBufferMenu', function()
   require('vibrainium').buffer_menu()
 end, { desc = 'Open context menu for the active tab in the current editor split' })
+
+vim.api.nvim_create_user_command('VibrainiumBufferPreview', function()
+  require('vibrainium').buffer_preview()
+end, { desc = 'Toggle in-place buffer render/editor mode' })
+
+vim.api.nvim_create_user_command('VibrainiumBufferPreviewToggle', function()
+  require('vibrainium').buffer_preview_toggle()
+end, { desc = 'Toggle in-place buffer render/editor mode' })
+
+vim.api.nvim_create_user_command('VibrainiumBufferPreviewSplit', function()
+  require('vibrainium').buffer_preview_split()
+end, { desc = 'Open preview in a split' })
+
+vim.api.nvim_create_user_command('VibrainiumTabClose', function()
+  require('vibrainium').buffer_close()
+end, { desc = 'Close the active tab in the current editor split' })
+
+vim.api.nvim_create_user_command('VibrainiumTabMenu', function()
+  require('vibrainium').buffer_menu()
+end, { desc = 'Open context menu for the active tab in the current editor split' })
+
+vim.api.nvim_create_user_command('VibrainiumTabPreview', function()
+  require('vibrainium').buffer_preview()
+end, { desc = 'Toggle in-place buffer render/editor mode' })
+
+vim.api.nvim_create_user_command('VibrainiumTabPreviewToggle', function()
+  require('vibrainium').buffer_preview_toggle()
+end, { desc = 'Toggle in-place buffer render/editor mode' })
+
+vim.api.nvim_create_user_command('VibrainiumTabPreviewSplit', function()
+  require('vibrainium').buffer_preview_split()
+end, { desc = 'Open preview in a split' })
+
+vim.api.nvim_create_user_command('VibrainiumMarkdownToggle', function()
+  require('vibrainium').markdown_toggle()
+end, { desc = 'Toggle in-place Markdown render/editor mode' })
+
+vim.api.nvim_create_user_command('VibrainiumMarkdownPreview', function()
+  require('vibrainium').markdown_preview()
+end, { desc = 'Open side-by-side Markdown preview in a split' })
+
+vim.api.nvim_create_user_command('VibrainiumMarkdownClose', function()
+  require('vibrainium').markdown_close()
+end, { desc = 'Close all active Markdown previews' })
+
+_G.VibrainiumBufferPreview = function()
+  require('vibrainium').buffer_preview()
+end
+
+_G.VibrainiumBufferPreviewToggle = function()
+  require('vibrainium').buffer_preview_toggle()
+end
+
+_G.VibrainiumBufferPreviewSplit = function()
+  require('vibrainium').buffer_preview_split()
+end
+
+_G.VibrainiumMarkdownToggle = function()
+  require('vibrainium').markdown_toggle()
+end
+
+_G.VibrainiumMarkdownPreview = function()
+  require('vibrainium').markdown_preview()
+end
 
 _G.VibrainiumWinbarSelect = function(minwid, _clicks, button, _modifiers)
   local pos = vim.fn.getmousepos()
@@ -478,27 +564,36 @@ local function bind_search_keymaps()
   vim.keymap.set('n', ']b', function()
     require('vibrainium').buffer_next()
   end, { desc = 'Vibrainium: Next Split Tab' })
-  vim.keymap.set('n', '<leader>bd', function()
+  vim.keymap.set('n', '<leader>td', function()
     require('vibrainium').buffer_close()
   end, { desc = 'Vibrainium: Close Split Tab' })
-  vim.keymap.set('n', '<leader>bo', function()
+  vim.keymap.set('n', '<leader>to', function()
     require('vibrainium').buffer_close_others()
   end, { desc = 'Vibrainium: Close Other Split Tabs' })
-  vim.keymap.set('n', '<leader>br', function()
+  vim.keymap.set('n', '<leader>tr', function()
     require('vibrainium').buffer_close_right()
   end, { desc = 'Vibrainium: Close Split Tabs to the Right' })
-  vim.keymap.set('n', '<leader>ba', function()
+  vim.keymap.set('n', '<leader>ta', function()
     require('vibrainium').buffer_close_all()
   end, { desc = 'Vibrainium: Close All Split Tabs' })
-  vim.keymap.set('n', '<leader>bm', function()
+  vim.keymap.set('n', '<leader>tm', function()
     require('vibrainium').buffer_menu()
   end, { desc = 'Vibrainium: Split Tab Context Menu' })
-  vim.keymap.set('n', '<leader>by', function()
+  vim.keymap.set('n', '<leader>ty', function()
     require('vibrainium').buffer_copy_path()
   end, { desc = 'Vibrainium: Copy Active File Path' })
-  vim.keymap.set('n', '<leader>bf', function()
+  vim.keymap.set('n', '<leader>tf', function()
     require('vibrainium').buffer_reveal()
   end, { desc = 'Vibrainium: Reveal Active File in Finder' })
+  vim.keymap.set('n', '<leader>tp', function()
+    require('vibrainium').buffer_preview()
+  end, { desc = 'Vibrainium: Toggle In-Place Buffer Render Mode' })
+  vim.keymap.set('n', '<leader>tps', function()
+    require('vibrainium').buffer_preview_split()
+  end, { desc = 'Vibrainium: Preview Active Buffer in Split' })
+  vim.keymap.set('n', '<leader>tt', function()
+    require('vibrainium').buffer_preview_toggle()
+  end, { desc = 'Vibrainium: Toggle In-Place Buffer Render Mode' })
   vim.keymap.set('n', '<leader>af', function()
     require('vibrainium').agent_send_file()
   end, { desc = 'Vibrainium: Add Active File to Agent Chat' })
@@ -546,7 +641,7 @@ local function capture_current_editor()
   last_editor_name = vim.api.nvim_buf_get_name(buf) or ''
   return true
 end
-vim.api.nvim_create_autocmd({ 'BufAdd', 'BufEnter', 'WinEnter', 'BufWinEnter', 'BufModifiedSet', 'BufDelete', 'BufWipeout', 'WinClosed', 'WinResized' }, {
+vim.api.nvim_create_autocmd({ 'BufAdd', 'BufEnter', 'WinEnter', 'BufWinEnter', 'BufModifiedSet', 'BufDelete', 'BufWipeout', 'WinClosed', 'WinResized', 'VimResized' }, {
   group = sync_group,
   callback = function()
     hide_global_tabline()
@@ -597,12 +692,41 @@ vim.api.nvim_create_autocmd({ 'BufAdd', 'BufEnter', 'WinEnter', 'BufWinEnter', '
   end,
 })
 
+vim.api.nvim_create_autocmd({ 'WinScrolled', 'CursorMoved' }, {
+  group = sync_group,
+  callback = function()
+    pcall(function()
+      require('vibrainium').action('buffer.scroll')
+    end)
+  end,
+})
+
+vim.api.nvim_create_autocmd({ 'TextChanged', 'TextChangedI' }, {
+  group = sync_group,
+  callback = function()
+    local ok_buf, buf = pcall(vim.api.nvim_get_current_buf)
+    if ok_buf and buf and buf > 0 then
+      pcall(function()
+        require('vibrainium').action('buffer.change', buf)
+      end)
+    end
+  end,
+})
+
 vim.api.nvim_create_autocmd('VimEnter', {
   callback = function()
     hide_global_tabline()
     pcall(vim.api.nvim_del_augroup_by_name, 'Neotree_start_directory')
     pcall(vim.api.nvim_del_augroup_by_name, 'neotree_auto_open')
-    require('vibrainium').workspace_open()
+    require('vibrainium').workspace_restore_state()
+  end,
+})
+
+vim.api.nvim_create_autocmd('VimLeavePre', {
+  callback = function()
+    pcall(function()
+      require('vibrainium').workspace_save_state()
+    end)
   end,
 })
 ''';
@@ -772,6 +896,22 @@ function M.workspace_reveal()
   M.action('workspace.reveal')
 end
 
+function M.workspace_save_state()
+  M.action('workspace.save_state')
+end
+
+function M.workspace_restore_state()
+  M.action('workspace.restore_state')
+end
+
+function M.workspace_resize(w)
+  M.action('workspace.resize', w)
+end
+
+function M.sidebar_resize(w)
+  M.action('sidebar.resize', w)
+end
+
 function M.problems_open()
   M.action('problems.open')
 end
@@ -893,6 +1033,50 @@ end
 
 function M.reload()
   M.action('reload')
+end
+
+function M.buffer_preview()
+  M.action('buffer.preview')
+end
+
+function M.buffer_preview_toggle()
+  M.action('buffer.preview_toggle')
+end
+
+function M.buffer_preview_split()
+  M.action('buffer.preview_split')
+end
+
+function M.tab_close()
+  M.action('buffer.close')
+end
+
+function M.tab_menu()
+  M.action('buffer.menu')
+end
+
+function M.tab_preview()
+  M.action('buffer.preview')
+end
+
+function M.tab_preview_toggle()
+  M.action('buffer.preview_toggle')
+end
+
+function M.tab_preview_split()
+  M.action('buffer.preview_split')
+end
+
+function M.markdown_toggle()
+  M.action('markdown.toggle')
+end
+
+function M.markdown_preview()
+  M.action('markdown.preview')
+end
+
+function M.markdown_close()
+  M.action('markdown.close')
 end
 
 function M.setup(_opts)

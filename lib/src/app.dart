@@ -1,4 +1,6 @@
+import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:viagent/viagent.dart';
 import 'package:viproblems/viproblems.dart';
@@ -6,7 +8,9 @@ import 'package:visearch/visearch.dart';
 import 'package:vivcs/vivcs.dart';
 import 'package:viworkspace/viworkspace.dart';
 
+import 'editor_home.dart';
 import 'editor_tabbar.dart';
+import 'markdown/markdown_preview_manager.dart';
 
 /// Active view inside the unified Vibrainium left sidepanel.
 enum VibrainiumTab {
@@ -38,6 +42,9 @@ class VibrainiumApp {
   late final AgentsPanel agentsPanel;
   late final VisearchPicker searchPicker;
   late final EditorTabbar editorTabbar;
+  late final EditorHomeView editorHome;
+  late final BufferPreviewManager bufferPreview;
+  BufferPreviewManager get markdownPreview => bufferPreview;
 
   static const String _wsTabLabel = ' 󰙅 Explorer [1] ';
   static const String _tabSeparator = '│';
@@ -85,6 +92,8 @@ class VibrainiumApp {
     'visearch-results',
     'visearch-preview',
     'visearch-dropdown',
+    'vibrainium-markdown-preview',
+    'vibrainium-preview',
   };
 
   VibrainiumTab _activeTab = VibrainiumTab.workspace;
@@ -98,9 +107,222 @@ class VibrainiumApp {
   int? _bottomTabbarWin;
   int? _bottomTabbarBuf;
 
+  bool _isClosingLeftPanel = false;
+  bool _isClosingBottomPanel = false;
+  bool _isOpeningLeftTab = false;
+  bool _isOpeningBottomTab = false;
+
   int? _lastActiveEditorWin;
   int? _lastSeenAlternateWin;
   bool _tabbarHighlightsInitialized = false;
+  bool _winClosedAutocmdInitialized = false;
+  int _currentSidebarWidth;
+  int? _nvimPid;
+  Timer? _saveStateDebounce;
+
+  int get currentSidebarWidth => _currentSidebarWidth;
+
+  Future<int> _resolveNvimPid() async {
+    if (_nvimPid != null) return _nvimPid!;
+    try {
+      final pid = await nvim.execLua('return vim.fn.getpid()');
+      if (pid is int) {
+        _nvimPid = pid;
+        return pid;
+      }
+    } catch (_) {}
+    return -1;
+  }
+
+  void scheduleSaveWorkspaceState() {
+    _saveStateDebounce?.cancel();
+    _saveStateDebounce = Timer(const Duration(milliseconds: 500), () {
+      saveWorkspaceState().catchError((_) {});
+    });
+  }
+
+  /// Persists the file explorer and editor split tabs state to `.vibrainium/state.json`.
+  Future<void> saveWorkspaceState() async {
+    final root = workspaceSidebar.rootPath ?? await nvim.getCwd();
+    final pid = await _resolveNvimPid();
+    if (pid > 0) {
+      if (WorkspaceStateLock.isHeldByOtherProcess(root, pid)) {
+        return; // Another live Neovim process holds write ownership.
+      }
+      WorkspaceStateLock.tryAcquire(root, pid);
+    }
+
+    final explorerState = await workspaceSidebar.exportExplorerState();
+    final currentWin = await nvim.getCurrentWin();
+    final layout = await editorTabbar.exportLayout(root);
+
+    // Resolve an active pane ID that is strictly an editor window, never a panel.
+    String? activePaneId;
+    if (await _isEditorCandidateWin(currentWin)) {
+      activePaneId = 'win-$currentWin';
+    } else if (await _isEditorCandidateWin(_lastActiveEditorWin)) {
+      activePaneId = 'win-$_lastActiveEditorWin';
+    } else if (layout != null) {
+      final firstLeaf = _findFirstLeaf(layout);
+      if (firstLeaf != null) {
+        activePaneId = firstLeaf.id;
+      }
+    }
+
+    final editorState = EditorState(
+      activePaneId: activePaneId,
+      layout: layout,
+    );
+
+    final state = VibrainiumWorkspaceState(
+      explorer: explorerState,
+      editor: editorState,
+    );
+    await state.saveAtomic(root);
+  }
+
+  static EditorLeafNode? _findFirstLeaf(EditorLayoutNode node) {
+    if (node is EditorLeafNode) return node;
+    if (node is EditorBranchNode) {
+      for (final child in node.children) {
+        final leaf = _findFirstLeaf(child);
+        if (leaf != null) return leaf;
+      }
+    }
+    return null;
+  }
+
+  /// Restores workspace tabs and explorer layout from `.vibrainium/state.json`.
+  Future<void> restoreWorkspaceState() async {
+    final root = workspaceSidebar.rootPath ?? await nvim.getCwd();
+    final pid = await _resolveNvimPid();
+    if (pid > 0 && !WorkspaceStateLock.isHeldByOtherProcess(root, pid)) {
+      WorkspaceStateLock.tryAcquire(root, pid);
+    }
+
+    final stateFile = File(VibrainiumWorkspaceState.stateFilePath(root));
+    if (!stateFile.existsSync()) {
+      await openTab(VibrainiumTab.workspace);
+      return;
+    }
+
+    final state = await VibrainiumWorkspaceState.load(root);
+
+    // 1. Restore editor layout & tabs first so main editor windows exist
+    if (state.editor.layout != null) {
+      await _restoreEditorLayout(state.editor, root);
+    }
+
+    // 2. Restore explorer
+    await workspaceSidebar.restoreExplorerState(
+      state.explorer,
+      openIfVisible: false,
+    );
+    if (state.explorer.isOpen) {
+      await openTab(VibrainiumTab.workspace);
+    } else {
+      await close();
+    }
+  }
+
+  Future<void> _restoreEditorLayout(
+    EditorState editorState,
+    String workspaceRoot,
+  ) async {
+    final layout = editorState.layout;
+    if (layout == null) return;
+
+    final allWins = await nvim.listWins();
+    int? anchorWin;
+    for (final w in allWins) {
+      if (await _isEditorCandidateWin(w)) {
+        anchorWin = w;
+        break;
+      }
+    }
+    anchorWin ??= await nvim.getCurrentWin();
+
+    final leafWinMap = <String, int>{};
+
+    Future<void> restoreNode(EditorLayoutNode node, int targetWin) async {
+      if (node is EditorLeafNode) {
+        leafWinMap[node.id] = targetWin;
+
+        // 1. Add all openFiles to buffer list
+        for (final rel in node.openFiles) {
+          final abs =
+              VibrainiumWorkspaceState.toAbsolutePath(workspaceRoot, rel);
+          if (File(abs).existsSync()) {
+            final escaped =
+                abs.replaceAll(r'\', '/').replaceAll(' ', r'\ ');
+            await nvim.command('badd $escaped');
+          }
+        }
+
+        // 2. Open activeFile in targetWin
+        if (node.activeFile != null) {
+          final abs = VibrainiumWorkspaceState.toAbsolutePath(
+              workspaceRoot, node.activeFile!);
+          if (File(abs).existsSync()) {
+            final escaped =
+                abs.replaceAll(r'\', '/').replaceAll(' ', r'\ ');
+            try {
+              final bufId = await nvim.execLua(
+                'return vim.fn.bufadd(...)',
+                [abs],
+              );
+              if (bufId is int && bufId > 0) {
+                await nvim.winSetBuf(targetWin, bufId);
+              }
+            } catch (_) {
+              await nvim.setCurrentWin(targetWin);
+              await nvim.command('edit $escaped');
+            }
+          }
+        }
+
+        // 3. Set dimensions if specified
+        if (node.width != null && node.width! > 0) {
+          try {
+            await nvim.winSetWidth(targetWin, node.width!);
+          } catch (_) {}
+        }
+        if (node.height != null && node.height! > 0) {
+          try {
+            await nvim.winSetHeight(targetWin, node.height!);
+          } catch (_) {}
+        }
+        return;
+      }
+
+      if (node is EditorBranchNode) {
+        final direction = node.type == 'row' ? 'right' : 'below';
+        var curWin = targetWin;
+        for (var i = 0; i < node.children.length; i++) {
+          final child = node.children[i];
+          if (i == 0) {
+            await restoreNode(child, curWin);
+          } else {
+            final newWin = await nvim.openWin(0, true, {
+              'win': curWin,
+              'split': direction,
+            });
+            await restoreNode(child, newWin);
+            curWin = newWin;
+          }
+        }
+      }
+    }
+
+    await restoreNode(layout, anchorWin);
+
+    final activeWin = leafWinMap[editorState.activePaneId];
+    if (activeWin != null && await nvim.winIsValid(activeWin)) {
+      await nvim.setCurrentWin(activeWin);
+    }
+
+    await editorTabbar.sync();
+  }
 
   VibrainiumApp({
     required this.nvim,
@@ -115,7 +337,7 @@ class VibrainiumApp {
     VisearchPicker? searchPicker,
     ProblemsPanel? problemsPanel,
     AgentsPanel? agentsPanel,
-  }) {
+  }) : _currentSidebarWidth = sidebarWidth {
     final sharedViff = viff ?? ViffController(nvim: nvim);
     this.viff = sharedViff;
     vcsSidebar = VivcsSidebar(
@@ -156,16 +378,52 @@ class VibrainiumApp {
           bindRpc: false,
         );
     this.searchPicker = searchPicker ?? VisearchPicker(nvim: nvim);
+    bufferPreview = BufferPreviewManager(nvim: nvim);
+    editorHome = EditorHomeView(
+      nvim: nvim,
+      getWorkspaceRoot: () async => this.workspaceSidebar.rootPath,
+      getUncheckedInFiles: (root) async {
+        final repos = vcsSidebar.repos.isNotEmpty
+            ? vcsSidebar.repos
+            : await discoverRepos(Directory(root), vcsSidebar.vcsList);
+        final seen = <String>{};
+        final out = <EditorHomeVcsFile>[];
+        for (final repo in repos) {
+          final status = await repo.vcs.status(repo.path);
+          for (final item in [...status.staged, ...status.unstaged]) {
+            final abs = '${repo.path.replaceAll(r'\', '/')}/${item.path}';
+            if (!seen.add(abs)) continue;
+            out.add(EditorHomeVcsFile(path: abs, statusCode: item.status.code));
+          }
+        }
+        return out;
+      },
+    );
     editorTabbar = EditorTabbar(
       nvim: nvim,
       nonEditorFiletypes: _nonEditorFiletypes,
       isPanelWin: _isPanelWin,
+      isPreviewWin: (w) => bufferPreview.isSplitPreviewWin(w),
+      getPreviewTitle: (w) => bufferPreview.getPreviewTitle(w),
+      getPreviewSourceBuf: (w) => bufferPreview.sourceBufForWin(w),
+      onClosePreview: (w) => bufferPreview.closePreview(w),
+      onShowEmptyHome: (win) => editorHome.showInWindow(win),
+      onTabClosedPath: (path) => editorHome.recordRecentFile(path),
+      onSync: () => editorHome.cleanupIfHidden(),
       onAddFileToChat: (filePath) =>
           this.agentsPanel.sendSelectionContext(filePath: filePath),
       onRevealInFinder: (filePath) => FileOps.revealInFinder(
         filePath,
         runProcess: this.workspaceSidebar.processRunner,
       ),
+      onPreview: (winId, bufId) =>
+          bufferPreview.openSplitPreview(targetWin: winId),
+      onPreviewToggle: (winId, bufId) =>
+          bufferPreview.toggleInPlace(targetWin: winId),
+      onMarkdownPreview: (winId, bufId) =>
+          bufferPreview.openSplitPreview(targetWin: winId),
+      onMarkdownToggle: (winId, bufId) =>
+          bufferPreview.toggleInPlace(targetWin: winId),
     );
     nvim.rpc.onRequest = _handleRpc;
     nvim.rpc.onNotification = (method, params) async {
@@ -185,13 +443,113 @@ class VibrainiumApp {
   int? get bottomTabbarWindowId => _bottomTabbarWin;
   int? get bottomTabbarBufferId => _bottomTabbarBuf;
 
-  bool _isPanelWin(int win) =>
+  bool _isLeftPanelWin(int win) =>
       win == _mainWin ||
       win == _tabbarWin ||
+      win == workspaceSidebar.windowId ||
       win == workspaceSidebar.searchPrompt.windowId ||
+      win == vcsSidebar.windowId;
+
+  bool _isBottomPanelWin(int win) =>
       win == _bottomMainWin ||
       win == _bottomTabbarWin ||
+      win == problemsPanel.windowId ||
+      win == agentsPanel.windowId ||
+      win == agentsPanel.treeWindowId ||
       win == agentsPanel.termWindowId;
+
+  bool _isPanelWin(int win) =>
+      _isLeftPanelWin(win) ||
+      _isBottomPanelWin(win) ||
+      win == viff.leftWindowId ||
+      win == viff.rightWindowId ||
+      win == searchPicker.paddingWindowId ||
+      win == searchPicker.promptWindowId ||
+      win == searchPicker.resultsWindowId ||
+      win == searchPicker.previewWindowId ||
+      bufferPreview.isSplitPreviewWin(win);
+
+  Future<void> _ensureWinClosedAutocmd() async {
+    if (_winClosedAutocmdInitialized) return;
+    _winClosedAutocmdInitialized = true;
+    try {
+      await nvim.execLua('''
+local grp = vim.api.nvim_create_augroup('VibrainiumPanelWinClosed', { clear = true })
+vim.api.nvim_create_autocmd({ 'WinClosed' }, {
+  group = grp,
+  callback = function(args)
+    local closed_win = tonumber(args.match)
+    if closed_win and closed_win > 0 then
+      pcall(function()
+        require('vibrainium').action('win_closed', closed_win)
+      end)
+    end
+  end,
+})
+''');
+    } catch (_) {}
+  }
+
+  Future<void> _handleWinClosed(int win) async {
+    if (!_isClosingLeftPanel && !_isOpeningLeftTab && _isLeftPanelWin(win)) {
+      await close();
+      return;
+    }
+    if (!_isClosingBottomPanel &&
+        !_isOpeningBottomTab &&
+        _isBottomPanelWin(win)) {
+      await closeBottomPanel();
+      return;
+    }
+    await _ensureSingleEditorPaneWhenPanelsOpen();
+  }
+
+  Future<void> _ensureSingleEditorPaneWhenPanelsOpen() async {
+    try {
+      final hasPanel = (_mainWin != null && await nvim.winIsValid(_mainWin!)) ||
+          (_bottomMainWin != null && await nvim.winIsValid(_bottomMainWin!));
+      if (!hasPanel) return;
+
+      final allWins = await nvim.listWins();
+      for (final w in allWins) {
+        if (await _isEditorCandidateWin(w)) return;
+      }
+
+      int? newWin;
+      if (_mainWin != null && await nvim.winIsValid(_mainWin!)) {
+        final buf = await nvim.createBuf(listed: false, scratch: true);
+        newWin = await nvim.openWin(buf, true, {
+          'win': _mainWin!,
+          'split': 'right',
+        });
+      } else if (_bottomMainWin != null &&
+          await nvim.winIsValid(_bottomMainWin!)) {
+        final buf = await nvim.createBuf(listed: false, scratch: true);
+        newWin = await nvim.openWin(buf, true, {
+          'win': _bottomMainWin!,
+          'split': 'above',
+        });
+      }
+      if (newWin != null && newWin > 0) {
+        _lastActiveEditorWin = newWin;
+        _syncAttachedWindows();
+        await editorHome.showInWindow(newWin);
+        await editorTabbar.sync();
+      }
+    } catch (_) {}
+  }
+
+  static bool isPanelFiletype(String ft) {
+    if (ft.isEmpty || ft == EditorHomeView.homeFiletype) return false;
+    if (_nonEditorFiletypes.contains(ft)) return true;
+    return ft.startsWith('viworkspace') ||
+        ft.startsWith('vivcs') ||
+        ft.startsWith('viff') ||
+        ft.startsWith('viproblems') ||
+        ft.startsWith('viagent') ||
+        ft.startsWith('visearch') ||
+        ft.startsWith('vibrainium');
+  }
 
   Future<bool> _isEditorCandidateWin(int? win) async {
     if (win == null || win <= 0 || _isPanelWin(win)) return false;
@@ -203,7 +561,8 @@ class VibrainiumApp {
       final buf = await nvim.winGetBuf(win);
       if (buf > 0) {
         final ft = (await nvim.bufGetOption(buf, 'filetype'))?.toString() ?? '';
-        if (_nonEditorFiletypes.contains(ft)) return false;
+        if (ft == EditorHomeView.homeFiletype) return true;
+        if (isPanelFiletype(ft)) return false;
         final bt = (await nvim.bufGetOption(buf, 'buftype'))?.toString() ?? '';
         if (bt.isNotEmpty) return false;
       }
@@ -227,7 +586,7 @@ class VibrainiumApp {
       final buf = await nvim.winGetBuf(win);
       if (buf > 0) {
         final ft = (await nvim.bufGetOption(buf, 'filetype'))?.toString() ?? '';
-        if (ft != 'viff' && _nonEditorFiletypes.contains(ft)) return false;
+        if (ft != 'viff' && isPanelFiletype(ft)) return false;
       }
       return true;
     } catch (_) {
@@ -268,65 +627,71 @@ class VibrainiumApp {
   }
 
   Future<void> openTab(VibrainiumTab tab) async {
-    await _rememberActiveEditorWin();
+    _isOpeningLeftTab = true;
+    try {
+      await _ensureWinClosedAutocmd();
+      await _rememberActiveEditorWin();
 
-    await vcsSidebar.closeModals();
-    await workspaceSidebar.closeModals();
-    await editorTabbar.closeModals();
-    _activeTab = tab;
+      await vcsSidebar.closeModals();
+      await workspaceSidebar.closeModals();
+      await editorTabbar.closeModals();
+      _activeTab = tab;
 
-    final targetBuf = tab == VibrainiumTab.workspace
-        ? await workspaceSidebar.ensureBuffer()
-        : await vcsSidebar.ensureBuffer();
+      final targetBuf = tab == VibrainiumTab.workspace
+          ? await workspaceSidebar.ensureBuffer()
+          : await vcsSidebar.ensureBuffer();
 
-    if (!await isOpen()) {
-      _mainWin = null;
-      await workspaceSidebar.closeSearchWin();
-      final staleTabWin = _tabbarWin;
-      _tabbarWin = null;
-      if (staleTabWin != null && await nvim.winIsValid(staleTabWin)) {
-        try {
-          if ((await nvim.listWins()).length > 1) {
-            await nvim.winClose(staleTabWin, force: true);
-          }
-        } catch (_) {}
+      if (!await isOpen()) {
+        _mainWin = null;
+        await workspaceSidebar.closeSearchWin();
+        final staleTabWin = _tabbarWin;
+        _tabbarWin = null;
+        if (staleTabWin != null && await nvim.winIsValid(staleTabWin)) {
+          try {
+            if ((await nvim.listWins()).length > 1) {
+              await nvim.winClose(staleTabWin, force: true);
+            }
+          } catch (_) {}
+        }
+        await _cleanupStaleSidepanelWins();
+        final mainWin = await nvim.openWin(targetBuf, true, {
+          'win': -1,
+          'split': 'left',
+          'width': _currentSidebarWidth,
+          'style': 'minimal',
+        });
+        _mainWin = mainWin;
+        await _configureMainWin(mainWin);
+        if (await isBottomPanelOpen() &&
+            _activeBottomTab == VibrainiumBottomTab.agents) {
+          await agentsPanel.syncTerminalSplit(focusTerminal: false);
+        }
+      } else {
+        final mainWin = _mainWin!;
+        await nvim.winSetBuf(mainWin, targetBuf);
+        await _configureMainWin(mainWin);
+        await nvim.setCurrentWin(mainWin);
       }
-      await _cleanupStaleSidepanelWins();
-      final mainWin = await nvim.openWin(targetBuf, true, {
-        'win': -1,
-        'split': 'left',
-        'width': sidebarWidth,
-        'style': 'minimal',
-      });
-      _mainWin = mainWin;
-      await _configureMainWin(mainWin);
-      if (await isBottomPanelOpen() &&
-          _activeBottomTab == VibrainiumBottomTab.agents) {
-        await agentsPanel.syncTerminalSplit(focusTerminal: false);
+
+      await _ensureTabbarWin();
+      _syncAttachedWindows();
+      await _renderTabbar();
+
+      if (tab == VibrainiumTab.workspace) {
+        await workspaceSidebar.ensureSearchWin();
+        _syncAttachedWindows();
+        await workspaceSidebar.ensureAutoSync();
+        await workspaceSidebar.refresh();
+        await workspaceSidebar.syncActiveFile(focusSidebar: false);
+      } else {
+        await workspaceSidebar.closeSearchWin();
+        _syncAttachedWindows();
+        await vcsSidebar.refresh(rescanRepos: vcsSidebar.repos.isEmpty);
       }
-    } else {
-      final mainWin = _mainWin!;
-      await nvim.winSetBuf(mainWin, targetBuf);
-      await _configureMainWin(mainWin);
-      await nvim.setCurrentWin(mainWin);
+      await editorTabbar.sync();
+    } finally {
+      _isOpeningLeftTab = false;
     }
-
-    await _ensureTabbarWin();
-    _syncAttachedWindows();
-    await _renderTabbar();
-
-    if (tab == VibrainiumTab.workspace) {
-      await workspaceSidebar.ensureSearchWin();
-      _syncAttachedWindows();
-      await workspaceSidebar.ensureAutoSync();
-      await workspaceSidebar.refresh();
-      await workspaceSidebar.syncActiveFile(focusSidebar: false);
-    } else {
-      await workspaceSidebar.closeSearchWin();
-      _syncAttachedWindows();
-      await vcsSidebar.refresh(rescanRepos: vcsSidebar.repos.isEmpty);
-    }
-    await editorTabbar.sync();
   }
 
   Future<void> toggleLeftPanel() async {
@@ -354,6 +719,38 @@ class VibrainiumApp {
         ? VibrainiumTab.vcs
         : VibrainiumTab.workspace;
     await openTab(next);
+  }
+
+  Future<void> updateSidebarWidth(
+    int newWidth, {
+    bool syncWindow = false,
+  }) async {
+    if (newWidth <= 0) return;
+    _currentSidebarWidth = newWidth;
+    workspaceSidebar.sidebarWidth = newWidth;
+    vcsSidebar.sidebarWidth = newWidth;
+    if (syncWindow) {
+      final mainWin = _mainWin;
+      if (mainWin != null && await nvim.winIsValid(mainWin)) {
+        await nvim.winSetWidth(mainWin, newWidth);
+      }
+    }
+    if (await isOpen()) {
+      await _renderTabbar();
+    }
+  }
+
+  Future<void> _syncSidebarLayout() async {
+    final mainWin = _mainWin;
+    if (mainWin != null && await nvim.winIsValid(mainWin)) {
+      final actualWidth = await nvim.winGetWidth(mainWin);
+      if (actualWidth > 0 && actualWidth != _currentSidebarWidth) {
+        _currentSidebarWidth = actualWidth;
+        workspaceSidebar.sidebarWidth = actualWidth;
+        vcsSidebar.sidebarWidth = actualWidth;
+        await _renderTabbar();
+      }
+    }
   }
 
   Future<void> handleTabbarClick() async {
@@ -464,95 +861,101 @@ class VibrainiumApp {
   }
 
   Future<void> openBottomTab(VibrainiumBottomTab tab) async {
-    await _rememberActiveEditorWin();
+    _isOpeningBottomTab = true;
+    try {
+      await _ensureWinClosedAutocmd();
+      await _rememberActiveEditorWin();
 
-    await problemsPanel.closeModals();
-    await agentsPanel.closeModals();
-    await editorTabbar.closeModals();
-    if (tab != VibrainiumBottomTab.agents) {
-      await agentsPanel.closeTerminalSplit();
-    }
-    _activeBottomTab = tab;
-
-    final targetBuf = tab == VibrainiumBottomTab.problems
-        ? await problemsPanel.ensureBuffer()
-        : await agentsPanel.ensureBuffer();
-
-    if (!await isBottomPanelOpen()) {
-      await _cleanupStaleBottomPanelWins();
-      int? anchorWin = _lastActiveEditorWin ??
-          workspaceSidebar.lastActiveEditorWin ??
-          vcsSidebar.lastActiveEditorWin ??
-          problemsPanel.lastActiveEditorWin ??
-          agentsPanel.lastActiveEditorWin;
-      if (anchorWin != null && !await _isEditorCandidateWin(anchorWin)) {
-        anchorWin = null;
+      await problemsPanel.closeModals();
+      await agentsPanel.closeModals();
+      await editorTabbar.closeModals();
+      if (tab != VibrainiumBottomTab.agents) {
+        await agentsPanel.closeTerminalSplit();
       }
-      List<int>? wins;
-      if (anchorWin == null) {
-        wins = await nvim.listWins();
-        for (final w in wins) {
-          if (await _isEditorCandidateWin(w)) {
-            anchorWin = w;
-            break;
+      _activeBottomTab = tab;
+
+      final targetBuf = tab == VibrainiumBottomTab.problems
+          ? await problemsPanel.ensureBuffer()
+          : await agentsPanel.ensureBuffer();
+
+      if (!await isBottomPanelOpen()) {
+        await _cleanupStaleBottomPanelWins();
+        int? anchorWin = _lastActiveEditorWin ??
+            workspaceSidebar.lastActiveEditorWin ??
+            vcsSidebar.lastActiveEditorWin ??
+            problemsPanel.lastActiveEditorWin ??
+            agentsPanel.lastActiveEditorWin;
+        if (anchorWin != null && !await _isEditorCandidateWin(anchorWin)) {
+          anchorWin = null;
+        }
+        List<int>? wins;
+        if (anchorWin == null) {
+          wins = await nvim.listWins();
+          for (final w in wins) {
+            if (await _isEditorCandidateWin(w)) {
+              anchorWin = w;
+              break;
+            }
           }
         }
-      }
-      if (anchorWin == null) {
-        wins ??= await nvim.listWins();
-        final fallbackCandidates = <int?>[
-          viff.rightWindowId,
-          _lastActiveEditorWin,
-          await nvim.getAlternateWin(),
-          ...wins,
-        ];
-        for (final candidate in fallbackCandidates) {
-          if (await _isFallbackMainAnchorWin(candidate)) {
-            anchorWin = candidate;
-            break;
+        if (anchorWin == null) {
+          wins ??= await nvim.listWins();
+          final fallbackCandidates = <int?>[
+            viff.rightWindowId,
+            _lastActiveEditorWin,
+            await nvim.getAlternateWin(),
+            ...wins,
+          ];
+          for (final candidate in fallbackCandidates) {
+            if (await _isFallbackMainAnchorWin(candidate)) {
+              anchorWin = candidate;
+              break;
+            }
           }
         }
-      }
-      if (anchorWin == null &&
-          _mainWin != null &&
-          await nvim.winIsValid(_mainWin!)) {
-        final emptyBuf = await nvim.createBuf(listed: true, scratch: false);
-        anchorWin = await nvim.openWin(emptyBuf, false, {
-          'win': _mainWin!,
-          'split': 'right',
+        if (anchorWin == null &&
+            _mainWin != null &&
+            await nvim.winIsValid(_mainWin!)) {
+          final emptyBuf = await nvim.createBuf(listed: true, scratch: false);
+          anchorWin = await nvim.openWin(emptyBuf, false, {
+            'win': _mainWin!,
+            'split': 'right',
+          });
+          _lastActiveEditorWin ??= anchorWin;
+        }
+
+        final bottomWin = await nvim.openWin(targetBuf, true, {
+          if (anchorWin != null) 'win': anchorWin,
+          'split': 'below',
+          'height': bottomPanelHeight,
+          'style': 'minimal',
         });
-        _lastActiveEditorWin ??= anchorWin;
+        _bottomMainWin = bottomWin;
+        await _configureBottomMainWin(bottomWin);
+      } else {
+        final bottomWin = _bottomMainWin!;
+        await nvim.winSetBuf(bottomWin, targetBuf);
+        await _configureBottomMainWin(bottomWin);
+        await nvim.setCurrentWin(bottomWin);
       }
 
-      final bottomWin = await nvim.openWin(targetBuf, true, {
-        if (anchorWin != null) 'win': anchorWin,
-        'split': 'below',
-        'height': bottomPanelHeight,
-        'style': 'minimal',
-      });
-      _bottomMainWin = bottomWin;
-      await _configureBottomMainWin(bottomWin);
-    } else {
-      final bottomWin = _bottomMainWin!;
-      await nvim.winSetBuf(bottomWin, targetBuf);
-      await _configureBottomMainWin(bottomWin);
-      await nvim.setCurrentWin(bottomWin);
-    }
-
-    await _ensureBottomTabbarWin();
-    _syncAttachedWindows();
-
-    if (tab == VibrainiumBottomTab.problems) {
-      await problemsPanel.ensureAutoRefresh();
-      await problemsPanel.refresh();
-    } else {
-      await agentsPanel.syncTerminalSplit(focusTerminal: false);
+      await _ensureBottomTabbarWin();
       _syncAttachedWindows();
-      await agentsPanel.refresh();
-    }
 
-    await _renderBottomTabbar();
-    await editorTabbar.sync();
+      if (tab == VibrainiumBottomTab.problems) {
+        await problemsPanel.ensureAutoRefresh();
+        await problemsPanel.refresh();
+      } else {
+        await agentsPanel.syncTerminalSplit(focusTerminal: false);
+        _syncAttachedWindows();
+        await agentsPanel.refresh();
+      }
+
+      await _renderBottomTabbar();
+      await editorTabbar.sync();
+    } finally {
+      _isOpeningBottomTab = false;
+    }
   }
 
   Future<void> toggleBottomPanel() async {
@@ -612,58 +1015,72 @@ class VibrainiumApp {
   }
 
   Future<void> closeBottomPanel() async {
-    await problemsPanel.closeModals();
-    await agentsPanel.closeModals();
-    await editorTabbar.closeModals();
-    await agentsPanel.closeTerminalSplit();
-    problemsPanel.attachWindow(null);
-    agentsPanel.attachWindow(null);
+    if (_isClosingBottomPanel) return;
+    _isClosingBottomPanel = true;
+    try {
+      await problemsPanel.closeModals();
+      await agentsPanel.closeModals();
+      await editorTabbar.closeModals();
+      await agentsPanel.closeTerminalSplit();
+      problemsPanel.attachWindow(null);
+      agentsPanel.attachWindow(null);
 
-    final tabWin = _bottomTabbarWin;
-    _bottomTabbarWin = null;
-    if (tabWin != null && await nvim.winIsValid(tabWin)) {
-      await nvim.winClose(tabWin, force: true);
+      final tabWin = _bottomTabbarWin;
+      _bottomTabbarWin = null;
+      if (tabWin != null && await nvim.winIsValid(tabWin)) {
+        await nvim.winClose(tabWin, force: true);
+      }
+
+      final bottomWin = _bottomMainWin;
+      _bottomMainWin = null;
+      if (bottomWin != null && await nvim.winIsValid(bottomWin)) {
+        await nvim.winClose(bottomWin, force: true);
+      }
+
+      _syncAttachedWindows();
+    } finally {
+      _isClosingBottomPanel = false;
     }
-
-    final bottomWin = _bottomMainWin;
-    _bottomMainWin = null;
-    if (bottomWin != null && await nvim.winIsValid(bottomWin)) {
-      await nvim.winClose(bottomWin, force: true);
-    }
-
-    _syncAttachedWindows();
   }
 
   Future<void> close() async {
-    await vcsSidebar.closeModals();
-    await workspaceSidebar.closeModals();
-    await workspaceSidebar.closeSearchWin();
-    await editorTabbar.closeModals();
-    vcsSidebar.attachWindow(null);
-    workspaceSidebar.attachWindow(null);
+    if (_isClosingLeftPanel) return;
+    _isClosingLeftPanel = true;
+    try {
+      await vcsSidebar.closeModals();
+      await workspaceSidebar.closeModals();
+      await workspaceSidebar.closeSearchWin();
+      await editorTabbar.closeModals();
+      vcsSidebar.attachWindow(null);
+      workspaceSidebar.attachWindow(null);
 
-    final tabWin = _tabbarWin;
-    _tabbarWin = null;
-    if (tabWin != null && await nvim.winIsValid(tabWin)) {
-      await nvim.winClose(tabWin, force: true);
+      final tabWin = _tabbarWin;
+      _tabbarWin = null;
+      if (tabWin != null && await nvim.winIsValid(tabWin)) {
+        await nvim.winClose(tabWin, force: true);
+      }
+
+      final mainWin = _mainWin;
+      _mainWin = null;
+      if (mainWin != null && await nvim.winIsValid(mainWin)) {
+        await nvim.winClose(mainWin, force: true);
+      }
+
+      if (await isBottomPanelOpen() &&
+          _activeBottomTab == VibrainiumBottomTab.agents) {
+        await agentsPanel.syncTerminalSplit(focusTerminal: false);
+      }
+
+      _syncAttachedWindows();
+    } finally {
+      _isClosingLeftPanel = false;
     }
-
-    final mainWin = _mainWin;
-    _mainWin = null;
-    if (mainWin != null && await nvim.winIsValid(mainWin)) {
-      await nvim.winClose(mainWin, force: true);
-    }
-
-    if (await isBottomPanelOpen() &&
-        _activeBottomTab == VibrainiumBottomTab.agents) {
-      await agentsPanel.syncTerminalSplit(focusTerminal: false);
-    }
-
-    _syncAttachedWindows();
   }
 
   Future<void> onHotReloaded() async {
     _tabbarHighlightsInitialized = false;
+    _winClosedAutocmdInitialized = false;
+    await _ensureWinClosedAutocmd();
     editorTabbar.resetForHotReload();
     await vcsSidebar.onHotReloaded();
     await workspaceSidebar.onHotReloaded();
@@ -788,6 +1205,8 @@ class VibrainiumApp {
     await nvim.winSetOption(win, 'statuscolumn', '');
     await nvim.winSetOption(win, 'wrap', false);
     await nvim.winSetOption(win, 'cursorline', true);
+    await nvim.winSetOption(win, 'scrolloff', 0);
+    await nvim.winSetOption(win, 'sidescrolloff', 0);
     await nvim.winSetOption(win, 'winfixwidth', true);
   }
 
@@ -799,6 +1218,8 @@ class VibrainiumApp {
     await nvim.winSetOption(win, 'statuscolumn', '');
     await nvim.winSetOption(win, 'wrap', false);
     await nvim.winSetOption(win, 'cursorline', true);
+    await nvim.winSetOption(win, 'scrolloff', 0);
+    await nvim.winSetOption(win, 'sidescrolloff', 0);
     await nvim.winSetOption(win, 'winfixheight', true);
   }
 
@@ -961,7 +1382,8 @@ class VibrainiumApp {
     const vcsCore = _vcsTabCore;
     final usedChars =
         wsLabel.runes.length + sep.runes.length + vcsCore.runes.length;
-    final padCount = (sidebarWidth - usedChars).clamp(0, sidebarWidth);
+    final width = _currentSidebarWidth;
+    final padCount = (width - usedChars).clamp(0, width);
     final vcsLabel = '$vcsCore${' ' * padCount}';
     final line = '$wsLabel$sep$vcsLabel';
 
@@ -1087,6 +1509,9 @@ class VibrainiumApp {
 
   Future<Object?> _handleRpc(String method, List<Object?> params) async {
     if (method == 'vibrainium_shutdown') {
+      try {
+        await bufferPreview.closeAllPreviews();
+      } catch (_) {}
       if (onShutdown != null) {
         await onShutdown!();
       }
@@ -1126,6 +1551,14 @@ class VibrainiumApp {
     }
 
     switch (action) {
+      case 'win_closed':
+        final closedWin = params.length > 1
+            ? int.tryParse(params[1]?.toString() ?? '')
+            : null;
+        if (closedWin != null) {
+          await _handleWinClosed(closedWin);
+        }
+        return true;
       case 'tab.click':
         await handleTabbarClick();
         return true;
@@ -1138,6 +1571,16 @@ class VibrainiumApp {
       case 'tab.workspace':
       case 'workspace.open':
         await openTab(VibrainiumTab.workspace);
+        return true;
+      case 'workspace.save_state':
+        await saveWorkspaceState();
+        if (_nvimPid != null) {
+          final root = workspaceSidebar.rootPath ?? await nvim.getCwd();
+          WorkspaceStateLock.release(root, _nvimPid!);
+        }
+        return true;
+      case 'workspace.restore_state':
+        await restoreWorkspaceState();
         return true;
       case 'tab.vcs':
       case 'open':
@@ -1219,9 +1662,34 @@ class VibrainiumApp {
         break;
       case 'editor_tab.sync':
       case 'buffer.sync':
+      case 'buffer.scroll':
         await _rememberActiveEditorWin();
+        await _syncSidebarLayout();
         await _ensureTabbarHighlights();
+        await bufferPreview.pruneStaleSessions();
         await editorTabbar.sync();
+        await bufferPreview.syncAll();
+        scheduleSaveWorkspaceState();
+        return true;
+      case 'buffer.change':
+        final raw = params.isNotEmpty ? params[0] : null;
+        final bufId = raw is int ? raw : (raw is String ? int.tryParse(raw.trim()) : null);
+        if (bufId != null && bufId > 0) {
+          await bufferPreview.onSourceBufferChanged(bufId);
+        }
+        return true;
+      case 'workspace.resize':
+      case 'sidebar.resize':
+      case 'panel.resize_left':
+        final raw = params.length > 1
+            ? params[1]
+            : (params.isNotEmpty ? params[0] : null);
+        final targetWidth = raw is int
+            ? raw
+            : (raw is String ? int.tryParse(raw.trim()) : null);
+        if (targetWidth != null && targetWidth > 0) {
+          await updateSidebarWidth(targetWidth, syncWindow: true);
+        }
         return true;
       case 'editor_tab.click':
         await _ensureTabbarHighlights();
@@ -1401,7 +1869,26 @@ class VibrainiumApp {
         await _ensureTabbarHighlights();
         await editorTabbar.cycleTab(-1, fallbackEditorWin: _lastActiveEditorWin);
         return true;
+      case 'buffer.preview':
+      case 'buffer.preview_toggle':
+      case 'markdown.toggle':
+        await bufferPreview.toggleInPlace();
+        await editorTabbar.sync();
+        await bufferPreview.syncAll(immediate: true);
+        return true;
+      case 'buffer.preview_split':
+      case 'markdown.preview':
+        await bufferPreview.openSplitPreview();
+        await editorTabbar.sync();
+        await bufferPreview.syncAll(immediate: true);
+        return true;
+      case 'buffer.preview_close':
+      case 'markdown.close':
+        await bufferPreview.closeAllPreviews();
+        await editorTabbar.sync();
+        return true;
       case 'reload':
+        await bufferPreview.closeAllPreviews();
         final res = await vcsSidebar.handleAction(action, params);
         await workspaceSidebar.onHotReloaded();
         await problemsPanel.onHotReloaded();
@@ -1453,6 +1940,7 @@ class VibrainiumApp {
       }
       await _ensureTabbarHighlights();
       await editorTabbar.sync();
+      scheduleSaveWorkspaceState();
       return res;
     }
     if (action.startsWith('problems.')) {
@@ -1464,7 +1952,34 @@ class VibrainiumApp {
       }
       await _ensureTabbarHighlights();
       await editorTabbar.sync();
+      scheduleSaveWorkspaceState();
       return res;
+    }
+    if (action.startsWith('home.')) {
+      await editorHome.handleAction(
+        action,
+        onOpenFile: (filePath, targetWin) async {
+          if (targetWin != null && await nvim.winIsValid(targetWin)) {
+            await nvim.setCurrentWin(targetWin);
+          }
+          final escaped =
+              filePath.replaceAll(r'\', '/').replaceAll(' ', r'\ ');
+          await nvim.command('edit $escaped');
+          await editorHome.cleanupIfHidden();
+          await workspaceSidebar.syncActiveFile(
+            filePath: filePath,
+            editorWin: targetWin,
+            focusSidebar: false,
+          );
+          await _ensureTabbarHighlights();
+          await editorTabbar.sync();
+          scheduleSaveWorkspaceState();
+        },
+        onTriggerSearch: (searchAction) async {
+          await _handleRpc(searchAction, const <Object?>[]);
+        },
+      );
+      return null;
     }
     if (action.startsWith('search.')) {
       final res = await searchPicker.handleAction(action, params);
@@ -1502,6 +2017,7 @@ class VibrainiumApp {
       }
       await _ensureTabbarHighlights();
       await editorTabbar.sync();
+      scheduleSaveWorkspaceState();
       return res;
     }
     final res = await vcsSidebar.handleAction(action, params);
